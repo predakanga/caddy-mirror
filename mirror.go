@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -132,10 +133,68 @@ func (f *Mirror) Validate() error {
 func (f *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// Consume the directive token
 	d.Next()
-	if !d.NextArg() {
-		return fmt.Errorf("block configuration is not yet implemented")
+	// If we have an argument, use that as the target
+	if d.NextArg() {
+		f.TargetServer = d.Val()
 	}
-	f.TargetServer = d.Val()
+	// Then we expect either EOF or a block
+	if d.CountRemainingArgs() > 0 {
+		return fmt.Errorf("expected at most a single target and an optional configuration block")
+	}
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "sample":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := strconv.ParseFloat(d.Val(), 64)
+			if err != nil {
+				return fmt.Errorf("invalid sample rate: %w", err)
+			}
+			f.SamplingRate = val
+		case "concurrency":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return fmt.Errorf("invalid concurrency: %w", err)
+			}
+			f.RequestConcurrency = val
+		case "backlog":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return fmt.Errorf("invalid backlog: %w", err)
+			}
+			f.MaxBacklog = val
+		case "timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := time.ParseDuration(d.Val())
+			if err != nil {
+				return fmt.Errorf("invalid timeout: %w", err)
+			}
+			f.RequestTimeout = val
+		case "target":
+			if f.TargetServer != "" {
+				return fmt.Errorf("target has already been set")
+			}
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			f.TargetServer = d.Val()
+		default:
+			return fmt.Errorf("unknown directive: %s", d.Val())
+		}
+	}
+
+	if f.TargetServer == "" {
+		return fmt.Errorf("target server is required")
+	}
 
 	return nil
 }
@@ -207,12 +266,14 @@ func (f *Mirror) mirror_worker() {
 }
 
 func (f *Mirror) EnsureDefaults() {
-	f.SamplingRate = max(f.SamplingRate, 1.0)
+	if f.SamplingRate <= 0 || f.SamplingRate >= 1.0 {
+		f.SamplingRate = 1.0
+	}
 	f.RequestConcurrency = max(max(f.RequestConcurrency, runtime.GOMAXPROCS(0)/2), 1)
 	if f.MaxBacklog < 1 {
 		f.MaxBacklog = f.RequestConcurrency * 128
 	}
-	if f.RequestTimeout < 1 {
+	if f.RequestTimeout <= 0 {
 		f.RequestTimeout = time.Second * 5
 	}
 }

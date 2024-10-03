@@ -92,9 +92,7 @@ func (*Mirror) CaddyModule() caddy.ModuleInfo {
 func (f *Mirror) Provision(ctx caddy.Context) error {
 	f.EnsureDefaults()
 	f.logger = ctx.Logger()
-	f.logger.Debug("Running Provision")
 	f.requestChan = make(chan Request, f.MaxBacklog)
-	f.logger.Debug("Created request channel", zap.Int("capacity", f.MaxBacklog))
 	f.cancelChan = make(chan interface{}, 1)
 	f.rng = rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
 	for i := 0; i < f.RequestConcurrency; i++ {
@@ -105,7 +103,6 @@ func (f *Mirror) Provision(ctx caddy.Context) error {
 }
 
 func (f *Mirror) Validate() error {
-	f.logger.Debug("Running Validate")
 	if f.TargetServer == "" {
 		return fmt.Errorf("target server is required")
 	}
@@ -128,16 +125,11 @@ func (f *Mirror) Validate() error {
 	if f.parsedTarget.RawQuery != "" {
 		return fmt.Errorf("query is not supported for mirror targets")
 	}
-	targetStr := fmt.Sprintf("%#v", f.parsedTarget)
-	f.logger.Debug("Final target", zap.String("target", targetStr))
 
 	return nil
 }
 
 func (f *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	if f.logger != nil {
-		f.logger.Debug("Running UnmarshalCaddyfile")
-	}
 	// Consume the directive token
 	d.Next()
 	if !d.NextArg() {
@@ -155,11 +147,9 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 }
 
 func (f *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	f.logger.Debug("Running ServeHTTP")
 	if f.rng.Float64() < f.SamplingRate {
 		select {
 		case f.requestChan <- serializeRequest(r):
-			f.logger.Debug("Successfully queued request")
 		default:
 			if f.droppedRequests.Add(1) == 1 {
 				go func() {
@@ -173,7 +163,6 @@ func (f *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 }
 
 func (f *Mirror) Cleanup() error {
-	f.logger.Debug("Running Cleanup")
 	close(f.cancelChan)
 	close(f.requestChan)
 
@@ -188,22 +177,17 @@ func create_roundtripper() http.RoundTripper {
 }
 
 func (f *Mirror) mirror_worker() {
-	f.logger.Debug("Running mirror_worker")
 	// Create a RoundTripper to service all requests for this worker
 	transport := create_roundtripper()
 	baseCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	defer func() { f.logger.Debug("Finished mirror_worker") }()
 
 	for {
 		select {
 		case _, _ = <-f.cancelChan:
 			return
 		case serReq := <-f.requestChan:
-			f.logger.Debug("Worker got a request")
 			req := serReq.deserialize(f.parsedTarget)
-			//reqStr := fmt.Sprintf("%#v", req)
-			//f.logger.Debug("Deserialized request", zap.String("request", reqStr))
 			ctx, requestCancel := context.WithTimeout(baseCtx, f.RequestTimeout)
 			//ctx := baseCtx
 			if resp, err := transport.RoundTrip(req.WithContext(ctx)); err == nil {

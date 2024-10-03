@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Debug" type="CompoundRunConfigurationType">
+    <toRun name="Connect to Delve" type="GoRemoteDebugConfigurationType" />
+    <toRun name="delve" type="ShConfigurationType" />
+    <method v="2" />
+  </configuration>
+</component>

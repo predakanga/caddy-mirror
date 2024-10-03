@@ -90,52 +90,52 @@ func (*Mirror) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (f *Mirror) Provision(ctx caddy.Context) error {
-	f.EnsureDefaults()
-	f.logger = ctx.Logger()
-	f.requestChan = make(chan Request, f.MaxBacklog)
-	f.cancelChan = make(chan interface{}, 1)
-	f.rng = rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
-	for i := 0; i < f.RequestConcurrency; i++ {
-		go f.mirror_worker()
+func (m *Mirror) Provision(ctx caddy.Context) error {
+	m.EnsureDefaults()
+	m.logger = ctx.Logger()
+	m.requestChan = make(chan Request, m.MaxBacklog)
+	m.cancelChan = make(chan interface{}, 1)
+	m.rng = rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+	for i := 0; i < m.RequestConcurrency; i++ {
+		go m.mirror_worker()
 	}
 
 	return nil
 }
 
-func (f *Mirror) Validate() error {
-	if f.TargetServer == "" {
+func (m *Mirror) Validate() error {
+	if m.TargetServer == "" {
 		return fmt.Errorf("target server is required")
 	}
 	var err error
-	f.parsedTarget, err = url.Parse(f.TargetServer)
+	m.parsedTarget, err = url.Parse(m.TargetServer)
 	if err != nil {
 		return err
 	}
 
-	if f.parsedTarget.Scheme == "" {
-		f.parsedTarget.Scheme = "http"
-		f.logger.Warn("Defaulting to HTTP for mirror target")
+	if m.parsedTarget.Scheme == "" {
+		m.parsedTarget.Scheme = "http"
+		m.logger.Warn("Defaulting to HTTP for mirror target")
 	}
-	if f.parsedTarget.Scheme != "http" && f.parsedTarget.Scheme != "https" {
+	if m.parsedTarget.Scheme != "http" && m.parsedTarget.Scheme != "https" {
 		return fmt.Errorf("target scheme must be either http or https")
 	}
-	if f.parsedTarget.RawPath != "" {
+	if m.parsedTarget.RawPath != "" {
 		return fmt.Errorf("path is not supported for mirror targets")
 	}
-	if f.parsedTarget.RawQuery != "" {
+	if m.parsedTarget.RawQuery != "" {
 		return fmt.Errorf("query is not supported for mirror targets")
 	}
 
 	return nil
 }
 
-func (f *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+func (m *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// Consume the directive token
 	d.Next()
 	// If we have an argument, use that as the target
 	if d.NextArg() {
-		f.TargetServer = d.Val()
+		m.TargetServer = d.Val()
 	}
 	// Then we expect either EOF or a block
 	if d.CountRemainingArgs() > 0 {
@@ -151,7 +151,7 @@ func (f *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err != nil {
 				return fmt.Errorf("invalid sample rate: %w", err)
 			}
-			f.SamplingRate = val
+			m.SamplingRate = val
 		case "concurrency":
 			if !d.NextArg() {
 				return d.ArgErr()
@@ -160,7 +160,7 @@ func (f *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err != nil {
 				return fmt.Errorf("invalid concurrency: %w", err)
 			}
-			f.RequestConcurrency = val
+			m.RequestConcurrency = val
 		case "backlog":
 			if !d.NextArg() {
 				return d.ArgErr()
@@ -169,7 +169,7 @@ func (f *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err != nil {
 				return fmt.Errorf("invalid backlog: %w", err)
 			}
-			f.MaxBacklog = val
+			m.MaxBacklog = val
 		case "timeout":
 			if !d.NextArg() {
 				return d.ArgErr()
@@ -178,21 +178,21 @@ func (f *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if err != nil {
 				return fmt.Errorf("invalid timeout: %w", err)
 			}
-			f.RequestTimeout = val
+			m.RequestTimeout = val
 		case "target":
-			if f.TargetServer != "" {
+			if m.TargetServer != "" {
 				return fmt.Errorf("target has already been set")
 			}
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
-			f.TargetServer = d.Val()
+			m.TargetServer = d.Val()
 		default:
 			return fmt.Errorf("unknown directive: %s", d.Val())
 		}
 	}
 
-	if f.TargetServer == "" {
+	if m.TargetServer == "" {
 		return fmt.Errorf("target server is required")
 	}
 
@@ -205,15 +205,15 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	return &m, err
 }
 
-func (f *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if f.rng.Float64() < f.SamplingRate {
+func (m *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if m.rng.Float64() < m.SamplingRate {
 		select {
-		case f.requestChan <- serializeRequest(r):
+		case m.requestChan <- serializeRequest(r):
 		default:
-			if f.droppedRequests.Add(1) == 1 {
+			if m.droppedRequests.Add(1) == 1 {
 				go func() {
 					time.Sleep(time.Duration(DROP_ALERT_INTERVAL) * time.Second)
-					f.logger.Warn("Dropped requests due to full backlog", zap.Uint64("count", f.droppedRequests.Swap(0)))
+					m.logger.Warn("Dropped requests due to full backlog", zap.Uint64("count", m.droppedRequests.Swap(0)))
 				}()
 			}
 		}
@@ -221,9 +221,9 @@ func (f *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	return next.ServeHTTP(w, r)
 }
 
-func (f *Mirror) Cleanup() error {
-	close(f.cancelChan)
-	close(f.requestChan)
+func (m *Mirror) Cleanup() error {
+	close(m.cancelChan)
+	close(m.requestChan)
 
 	return nil
 }
@@ -235,7 +235,7 @@ func create_roundtripper() http.RoundTripper {
 	}
 }
 
-func (f *Mirror) mirror_worker() {
+func (m *Mirror) mirror_worker() {
 	// Create a RoundTripper to service all requests for this worker
 	transport := create_roundtripper()
 	baseCtx, cancel := context.WithCancel(context.Background())
@@ -243,37 +243,37 @@ func (f *Mirror) mirror_worker() {
 
 	for {
 		select {
-		case _, _ = <-f.cancelChan:
+		case _, _ = <-m.cancelChan:
 			return
-		case serReq := <-f.requestChan:
-			req := serReq.deserialize(f.parsedTarget)
-			ctx, requestCancel := context.WithTimeout(baseCtx, f.RequestTimeout)
+		case serReq := <-m.requestChan:
+			req := serReq.deserialize(m.parsedTarget)
+			ctx, requestCancel := context.WithTimeout(baseCtx, m.RequestTimeout)
 			//ctx := baseCtx
 			if resp, err := transport.RoundTrip(req.WithContext(ctx)); err == nil {
 				// Copy the response body to the bitbucket
 				if _, err = io.Copy(io.Discard, resp.Body); err != nil {
-					f.logger.Error("Failed to read response", zap.Error(err))
+					m.logger.Error("Failed to read response", zap.Error(err))
 				}
 				if err = resp.Body.Close(); err != nil {
-					f.logger.Error("Failed to close response body", zap.Error(err))
+					m.logger.Error("Failed to close response body", zap.Error(err))
 				}
 			} else {
-				f.logger.Error("Failed to mirror request", zap.Error(err))
+				m.logger.Error("Failed to mirror request", zap.Error(err))
 			}
 			requestCancel()
 		}
 	}
 }
 
-func (f *Mirror) EnsureDefaults() {
-	if f.SamplingRate <= 0 || f.SamplingRate >= 1.0 {
-		f.SamplingRate = 1.0
+func (m *Mirror) EnsureDefaults() {
+	if m.SamplingRate <= 0 || m.SamplingRate >= 1.0 {
+		m.SamplingRate = 1.0
 	}
-	f.RequestConcurrency = max(max(f.RequestConcurrency, runtime.GOMAXPROCS(0)/2), 1)
-	if f.MaxBacklog < 1 {
-		f.MaxBacklog = f.RequestConcurrency * 128
+	m.RequestConcurrency = max(max(m.RequestConcurrency, runtime.GOMAXPROCS(0)/2), 1)
+	if m.MaxBacklog < 1 {
+		m.MaxBacklog = m.RequestConcurrency * 128
 	}
-	if f.RequestTimeout <= 0 {
-		f.RequestTimeout = time.Second * 5
+	if m.RequestTimeout <= 0 {
+		m.RequestTimeout = time.Second * 5
 	}
 }

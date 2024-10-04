@@ -2,13 +2,14 @@ package mirror
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/petermattis/goid"
 	"go.uber.org/zap"
-	"io"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -33,14 +34,29 @@ type Request struct {
 	query   string
 }
 
-func serializeRequest(r *http.Request) Request {
-	return Request{
-		r.Host,
-		r.Method,
-		r.Header.Clone(),
-		r.URL.RawPath,
-		r.URL.RawQuery,
+// cloneRequest makes a semi-deep clone of origReq.
+//
+// Copied from https://github.com/caddyserver/caddy/blob/f4bf4e0097853438eb69c573bbaa0581e9b9c02d/modules/caddyhttp/reverseproxy/reverseproxy.go
+func cloneRequest(origReq *http.Request) *http.Request {
+	// Just clone the request - the reverse proxy will do the rewriting later in ServeHTTP
+	req := new(http.Request)
+	*req = *origReq
+	if origReq.URL != nil {
+		newURL := new(url.URL)
+		*newURL = *origReq.URL
+		if origReq.URL.User != nil {
+			newURL.User = new(url.Userinfo)
+			*newURL.User = *origReq.URL.User
+		}
+		req.URL = newURL
 	}
+	if origReq.Header != nil {
+		req.Header = origReq.Header.Clone()
+	}
+	if origReq.Trailer != nil {
+		req.Trailer = origReq.Trailer.Clone()
+	}
+	return req
 }
 
 func (r Request) deserialize(baseUrl *url.URL) *http.Request {
@@ -60,18 +76,18 @@ func (r Request) deserialize(baseUrl *url.URL) *http.Request {
 }
 
 type Mirror struct {
-	SamplingRate       float64       `json:"sampling_rate,omitempty"`
-	RequestConcurrency int           `json:"request_concurrency,omitempty"`
-	MaxBacklog         int           `json:"max_backlog,omitempty"`
-	TargetServer       string        `json:"target,omitempty"`
-	RequestTimeout     time.Duration `json:"request_timeout,omitempty"`
+	SamplingRate       float64         `json:"sampling_rate,omitempty"`
+	RequestConcurrency int             `json:"request_concurrency,omitempty"`
+	MaxBacklog         int             `json:"max_backlog,omitempty"`
+	TargetServer       json.RawMessage `json:"target,omitempty"`
+	RequestTimeout     time.Duration   `json:"request_timeout,omitempty"`
 
-	requestChan     chan Request
+	requestChan     chan *http.Request
 	cancelChan      chan interface{}
 	rng             *rand.Rand
-	parsedTarget    *url.URL
 	logger          *zap.Logger
 	droppedRequests atomic.Uint64
+	reverseProxy    caddyhttp.MiddlewareHandler
 }
 
 var (
@@ -93,108 +109,98 @@ func (*Mirror) CaddyModule() caddy.ModuleInfo {
 func (m *Mirror) Provision(ctx caddy.Context) error {
 	m.EnsureDefaults()
 	m.logger = ctx.Logger()
-	m.requestChan = make(chan Request, m.MaxBacklog)
+	m.requestChan = make(chan *http.Request, m.MaxBacklog)
 	m.cancelChan = make(chan interface{}, 1)
 	m.rng = rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+
+	// Load the reverse proxy
+	if m.TargetServer != nil {
+		mod, err := ctx.LoadModuleByID("http.handlers.reverse_proxy", m.TargetServer)
+		if err != nil {
+			return fmt.Errorf("loading reverse proxy module failed: %w", err)
+		}
+		m.reverseProxy = mod.(caddyhttp.MiddlewareHandler)
+	}
+
 	for i := 0; i < m.RequestConcurrency; i++ {
-		go m.mirror_worker()
+		go m.mirrorWorker()
 	}
 
 	return nil
 }
 
 func (m *Mirror) Validate() error {
-	if m.TargetServer == "" {
-		return fmt.Errorf("target server is required")
-	}
-	var err error
-	m.parsedTarget, err = url.Parse(m.TargetServer)
-	if err != nil {
-		return err
-	}
-
-	if m.parsedTarget.Scheme == "" {
-		m.parsedTarget.Scheme = "http"
-		m.logger.Warn("Defaulting to HTTP for mirror target")
-	}
-	if m.parsedTarget.Scheme != "http" && m.parsedTarget.Scheme != "https" {
-		return fmt.Errorf("target scheme must be either http or https")
-	}
-	if m.parsedTarget.RawPath != "" {
-		return fmt.Errorf("path is not supported for mirror targets")
-	}
-	if m.parsedTarget.RawQuery != "" {
-		return fmt.Errorf("query is not supported for mirror targets")
+	if m.reverseProxy == nil {
+		return fmt.Errorf("target is required")
 	}
 
 	return nil
 }
 
 func (m *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	// Consume the directive token
-	d.Next()
-	// If we have an argument, use that as the target
-	if d.NextArg() {
-		m.TargetServer = d.Val()
-	}
-	// Then we expect either EOF or a block
-	if d.CountRemainingArgs() > 0 {
-		return fmt.Errorf("expected at most a single target and an optional configuration block")
-	}
-	for d.NextBlock(0) {
-		switch d.Val() {
-		case "sample":
-			if !d.NextArg() {
-				return d.ArgErr()
+	// As done in the forward_auth unmarshaler, use the following flow
+	// Save our dispenser for the reverse_proxy unmarshaler
+	// Consume all of our own directives, removing them from the dispenser
+	// Call the reverse_proxy unmarshaler
+	for d.Next() {
+		for d.NextBlock(0) {
+			// Only handle top-level directives
+			if d.Nesting() != 1 {
+				continue
 			}
-			val, err := strconv.ParseFloat(d.Val(), 64)
-			if err != nil {
-				return fmt.Errorf("invalid sample rate: %w", err)
+
+			switch d.Val() {
+			case "sample":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				val, err := strconv.ParseFloat(d.Val(), 64)
+				if err != nil {
+					return fmt.Errorf("invalid sample rate: %w", err)
+				}
+				m.SamplingRate = val
+				d.DeleteN(2)
+			case "concurrency":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				val, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return fmt.Errorf("invalid concurrency: %w", err)
+				}
+				m.RequestConcurrency = val
+				d.DeleteN(2)
+			case "backlog":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				val, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return fmt.Errorf("invalid backlog: %w", err)
+				}
+				m.MaxBacklog = val
+				d.DeleteN(2)
+			case "timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				val, err := time.ParseDuration(d.Val())
+				if err != nil {
+					return fmt.Errorf("invalid timeout: %w", err)
+				}
+				m.RequestTimeout = val
+				d.DeleteN(2)
 			}
-			m.SamplingRate = val
-		case "concurrency":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			val, err := strconv.Atoi(d.Val())
-			if err != nil {
-				return fmt.Errorf("invalid concurrency: %w", err)
-			}
-			m.RequestConcurrency = val
-		case "backlog":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			val, err := strconv.Atoi(d.Val())
-			if err != nil {
-				return fmt.Errorf("invalid backlog: %w", err)
-			}
-			m.MaxBacklog = val
-		case "timeout":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			val, err := time.ParseDuration(d.Val())
-			if err != nil {
-				return fmt.Errorf("invalid timeout: %w", err)
-			}
-			m.RequestTimeout = val
-		case "target":
-			if m.TargetServer != "" {
-				return fmt.Errorf("target has already been set")
-			}
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			m.TargetServer = d.Val()
-		default:
-			return fmt.Errorf("unknown directive: %s", d.Val())
 		}
 	}
-
-	if m.TargetServer == "" {
-		return fmt.Errorf("target server is required")
+	// Reset the dispenser and unmarshal the reverse proxy
+	d.Reset()
+	d.Next()
+	reverseProxy, err := caddyfile.UnmarshalModule(d, "http.handlers.reverse_proxy")
+	if err != nil {
+		return err
 	}
+	m.reverseProxy = reverseProxy.(caddyhttp.MiddlewareHandler)
 
 	return nil
 }
@@ -202,13 +208,21 @@ func (m *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var m Mirror
 	err := m.UnmarshalCaddyfile(h.Dispenser)
+	if err != nil {
+		return nil, fmt.Errorf("parsing caddyfile failed: %w", err)
+	}
+	reverseProxyJson, err := json.Marshal(m.reverseProxy)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling reverse proxy failed: %w", err)
+	}
+	m.TargetServer = reverseProxyJson
 	return &m, err
 }
 
 func (m *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if m.rng.Float64() < m.SamplingRate {
 		select {
-		case m.requestChan <- serializeRequest(r):
+		case m.requestChan <- cloneRequest(r):
 		default:
 			if m.droppedRequests.Add(1) == 1 {
 				go func() {
@@ -228,36 +242,34 @@ func (m *Mirror) Cleanup() error {
 	return nil
 }
 
-func create_roundtripper() http.RoundTripper {
-	return &http.Transport{
-		MaxIdleConns:    1,
-		MaxConnsPerHost: 1,
-	}
+type discardWriter struct{}
+
+func (d discardWriter) Header() http.Header {
+	return http.Header{}
 }
 
-func (m *Mirror) mirror_worker() {
-	// Create a RoundTripper to service all requests for this worker
-	transport := create_roundtripper()
-	baseCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func (d discardWriter) Write(bytes []byte) (int, error) {
+	return len(bytes), nil
+}
 
+func (d discardWriter) WriteHeader(_ int) {
+	return
+}
+
+func (m *Mirror) mirrorWorker() {
 	for {
 		select {
 		case _, _ = <-m.cancelChan:
 			return
-		case serReq := <-m.requestChan:
-			req := serReq.deserialize(m.parsedTarget)
-			ctx, requestCancel := context.WithTimeout(baseCtx, m.RequestTimeout)
-			//ctx := baseCtx
-			if resp, err := transport.RoundTrip(req.WithContext(ctx)); err == nil {
-				// Copy the response body to the bitbucket
-				if _, err = io.Copy(io.Discard, resp.Body); err != nil {
-					m.logger.Error("Failed to read response", zap.Error(err))
-				}
-				if err = resp.Body.Close(); err != nil {
-					m.logger.Error("Failed to close response body", zap.Error(err))
-				}
-			} else {
+		case req := <-m.requestChan:
+			// Add our goroutine ID to the headers
+			req.Header.Set("X-Goroutine-ID", strconv.FormatInt(goid.Get(), 10))
+			// Pass the request to the reverse proxy, with a no-op response writer
+			w := discardWriter{}
+			ctx, requestCancel := context.WithTimeout(req.Context(), m.RequestTimeout)
+			if err := m.reverseProxy.ServeHTTP(w, req.WithContext(ctx), caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+				return nil
+			})); err != nil {
 				m.logger.Error("Failed to mirror request", zap.Error(err))
 			}
 			requestCancel()

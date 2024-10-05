@@ -1,6 +1,6 @@
 module github.com/predakanga/caddy-mirror
 
-go 1.23.1
+go 1.22.8
 
 require (
 	github.com/caddyserver/caddy/v2 v2.8.4

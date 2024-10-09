@@ -40,14 +40,14 @@ func serializeRequest(r *http.Request) Request {
 		r.Host,
 		r.Method,
 		headers,
-		r.URL.RawPath,
+		r.URL.Path,
 		r.URL.RawQuery,
 	}
 }
 
 func (r Request) deserialize(baseUrl *url.URL) *http.Request {
 	targetUrl := *baseUrl
-	targetUrl.RawPath = r.path
+	targetUrl.Path = r.path
 	targetUrl.RawQuery = r.query
 
 	return &http.Request{

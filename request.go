@@ -14,6 +14,7 @@ type Request struct {
 	headers http.Header
 	path    string
 	query   string
+	user    *url.Userinfo
 }
 
 func serializeRequest(r *http.Request) Request {
@@ -36,19 +37,28 @@ func serializeRequest(r *http.Request) Request {
 		headers.Set("X-Forwarded-For", remoteIp)
 	}
 
-	return Request{
+	toRet := Request{
 		r.Host,
 		r.Method,
 		headers,
 		r.URL.Path,
 		r.URL.RawQuery,
+		nil,
 	}
+
+	// Copy the user if it exists
+	if r.URL.User != nil {
+		toRet.user = &*r.URL.User
+	}
+
+	return toRet
 }
 
 func (r Request) deserialize(baseUrl *url.URL) *http.Request {
 	targetUrl := *baseUrl
 	targetUrl.Path = r.path
 	targetUrl.RawQuery = r.query
+	targetUrl.User = r.user
 
 	return &http.Request{
 		Host:       r.host,
